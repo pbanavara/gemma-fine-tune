@@ -1,0 +1,18 @@
+# Training outputs
+gemma4-transplant/
+gemma4-transplant-vllm/
+gemma4-gguf/
+gemma4-gguf_gguf/
+
+# Unsloth compiled cache
+unsloth_compiled_cache/
+
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pth
+*.bin
+*.safetensors
