@@ -1,60 +1,87 @@
 """
-Merge LoRA adapter into base model using standard PEFT merge_and_unload().
-Use this instead of Unsloth's save_pretrained_merged when the latter produces
-garbage output (known issue with Gemma4ForConditionalGeneration).
+Merge LoRA adapter into base model without any PEFT wrapper.
+Loads clean HF base model, reads adapter safetensors directly,
+applies lora_B @ lora_A * scale to each base weight, saves cleanly.
+vLLM requires plain weight keys — no base_layer. prefix.
 """
 import torch
 import json
 from pathlib import Path
+from safetensors import safe_open
 from transformers import AutoProcessor, Gemma4ForConditionalGeneration
-from peft import PeftModel
 
-ADAPTER_PATH = "./gemma4-transplant/checkpoint-88"
+ADAPTER_PATH = "./gemma4-transplant/checkpoint-480"
 OUTPUT_PATH  = "./gemma4-transplant-vllm"
 BASE_MODEL   = "unsloth/gemma-4-E4B-it"
 
-print("Step 1: Loading base model in bf16...")
+# Read adapter config for r / lora_alpha
+with open(f"{ADAPTER_PATH}/adapter_config.json") as f:
+    adapter_cfg = json.load(f)
+r          = adapter_cfg["r"]
+lora_alpha = adapter_cfg["lora_alpha"]
+scale      = lora_alpha / r
+print(f"LoRA config: r={r}, lora_alpha={lora_alpha}, scale={scale:.4f}")
+
+print("Step 1: Loading clean base model in bf16...")
 model = Gemma4ForConditionalGeneration.from_pretrained(
     BASE_MODEL,
     torch_dtype=torch.bfloat16,
-    device_map="auto",
+    device_map="cpu",   # stay on CPU — we just need to do math and save
 )
 print(f"  Loaded: {sum(p.numel() for p in model.parameters())/1e9:.2f}B params")
 
-print("Step 2: Loading LoRA adapter...")
-model = PeftModel.from_pretrained(model, ADAPTER_PATH)
+# Build param lookup: full dotted name → tensor
+params = dict(model.named_parameters())
+print(f"  Base model has {len(params)} parameters")
 
-print("Step 3: Quick sanity check before merge...")
-processor = AutoProcessor.from_pretrained(ADAPTER_PATH)
-messages = [{"role": "user", "content": [{"type": "text", "text":
-    "You are a transplant coordinator.\n\n[Patient is ready to receive the coordinator's call.]"
-}]}]
-text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-inputs = processor(text=text, return_tensors="pt").to(model.device)
-with torch.no_grad():
-    out = model.generate(**inputs, max_new_tokens=60, do_sample=False)
-response = processor.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-print(f"  Pre-merge response: {repr(response)}")
+print("Step 2: Loading LoRA adapter weights...")
+adapter_sd = {}
+with safe_open(f"{ADAPTER_PATH}/adapter_model.safetensors", framework="pt", device="cpu") as f:
+    for key in f.keys():
+        adapter_sd[key] = f.get_tensor(key)
+print(f"  Loaded {len(adapter_sd)} adapter tensors")
 
-if not response.strip() or len([c for c in response if c.isascii() and c.isalpha()]) < 5:
-    print("  WARNING: pre-merge output is garbage — issue is in training, not the merge step")
-else:
-    print("  Pre-merge output looks coherent — proceeding with PEFT merge")
+print("Step 3: Applying LoRA deltas...")
+merged = 0
+skipped = 0
+# Adapter keys look like:
+#   base_model.model.model.language_model.layers.0.mlp.down_proj.lora_A.weight
+# Base model param names look like:
+#   model.language_model.layers.0.mlp.down_proj.weight
+# Strip the leading "base_model.model." to get the base param prefix.
+lora_A_keys = [k for k in adapter_sd if k.endswith(".lora_A.weight")]
+for a_key in lora_A_keys:
+    b_key = a_key.replace(".lora_A.weight", ".lora_B.weight")
+    if b_key not in adapter_sd:
+        print(f"  WARNING: no lora_B for {a_key}, skipping")
+        skipped += 1
+        continue
+    # Derive the base param name
+    base_key = a_key.removeprefix("base_model.model.").replace(".lora_A.weight", ".weight")
+    if base_key not in params:
+        print(f"  WARNING: base param not found: {base_key}")
+        skipped += 1
+        continue
+    lora_A = adapter_sd[a_key].float()   # (r, in_features)
+    lora_B = adapter_sd[b_key].float()   # (out_features, r)
+    delta  = (lora_B @ lora_A * scale).to(torch.bfloat16)
+    params[base_key].data += delta
+    merged += 1
+print(f"  Merged {merged} layers, skipped {skipped}")
 
-print("Step 4: Merging LoRA into base weights (PEFT merge_and_unload)...")
-model = model.merge_and_unload()
-
-print("Step 5: Saving merged model...")
+print("Step 4: Saving merged model...")
+Path(OUTPUT_PATH).mkdir(parents=True, exist_ok=True)
 model.save_pretrained(OUTPUT_PATH, safe_serialization=True)
+processor = AutoProcessor.from_pretrained(ADAPTER_PATH)
 processor.save_pretrained(OUTPUT_PATH)
 
-# Patch use_cache for vLLM inference
+# Patch use_cache=True — unsloth sets it False during training
 config_path = Path(OUTPUT_PATH) / "config.json"
 with open(config_path) as f:
     cfg = json.load(f)
 cfg["use_cache"] = True
 with open(config_path, "w") as f:
     json.dump(cfg, f, indent=4)
+print("  Patched use_cache=True")
 
-print(f"Done. Merged model saved to {OUTPUT_PATH}")
-print("Restart vLLM to serve the new weights.")
+print(f"\nDone. Merged model at {OUTPUT_PATH} — restart vLLM to serve.")

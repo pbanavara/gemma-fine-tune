@@ -6,7 +6,7 @@ import torch
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template
 
-ADAPTER_PATH = "./gemma4-transplant/checkpoint-88"
+ADAPTER_PATH = "./gemma4-transplant/checkpoint-480"
 
 print("Loading base model + LoRA adapter via Unsloth...")
 model, processor = FastLanguageModel.from_pretrained(
@@ -24,7 +24,7 @@ def test(label, messages):
     text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     ).removeprefix("<bos>")
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    inputs = tokenizer(text=text, return_tensors="pt").to(model.device)
     with torch.no_grad():
         out = model.generate(
             **inputs, max_new_tokens=120, do_sample=True,
